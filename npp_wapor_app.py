@@ -18,7 +18,7 @@ Scale factor (0.001) and no-data value (-9999) are applied automatically
 by this script when reading each GeoTIFF.
 
 SETUP:
-    pip install streamlit wapordl rasterio pyshp pyproj pandas matplotlib numpy shapely --break-system-packages
+    pip install streamlit wapordl rasterio pyshp pyproj pandas matplotlib numpy --break-system-packages
 
 RUN:
     streamlit run npp_wapor_app.py
@@ -41,26 +41,6 @@ import matplotlib.dates as mdates
 import rasterio
 from rasterio.mask import mask as rio_mask
 from wapordl import wapor_map
-from shapely.geometry import shape, mapping
-from shapely.ops import transform
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Geometry Reprojection Helper (Fixes CRS Mismatch Mismatches)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def reproject_geometry(geometry, target_crs, source_crs="EPSG:4326"):
-    """
-    Reprojects a GeoJSON geometry dictionary from EPSG:4326 to the target raster CRS
-    (e.g., UTM Zone 36N) so that spatial operations like rasterio.mask intersect accurately.
-    """
-    if str(target_crs).upper() == source_crs.upper():
-        return geometry
-        
-    transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
-    shapely_geom = shape(geometry)
-    reprojected_geom = transform(transformer.transform, shapely_geom)
-    return mapping(reprojected_geom)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Boundary loading (Shapefile / KML / KMZ, one or more polygons)
@@ -240,7 +220,7 @@ def _date_from_filename(fname):
                     return f"{groups[0]}-{groups[1]}-01"
             except Exception:
                 continue
-    return None
+    return None  # caller falls back to filename order
 
 
 def polygon_bbox(geometry):
@@ -251,11 +231,30 @@ def polygon_bbox(geometry):
     return [min(lons), min(lats), max(lons), max(lats)]
 
 
+def reproject_geometry(geometry, dst_crs):
+    """
+    Reproject a GeoJSON Polygon from EPSG:4326 (lon/lat, what the uploaded
+    boundary is in) into dst_crs (whatever CRS the WaPOR raster actually
+    uses — typically a UTM zone, e.g. EPSG:32636 for Northern Egypt, NOT
+    plain lat/lon). Read dynamically per-raster since this can vary.
+    """
+    transformer = Transformer.from_crs("EPSG:4326", dst_crs, always_xy=True)
+    new_coords = []
+    for ring in geometry["coordinates"]:
+        new_ring = [list(transformer.transform(x, y)) for x, y in ring]
+        new_coords.append(new_ring)
+    return {"type": geometry["type"], "coordinates": new_coords}
+
+
 def fetch_npp_series(geometry, start_date, end_date, work_dir):
     """
     Downloads monthly WaPOR v3 NPP GeoTIFFs covering the polygon's bounding
-    box, dynamically reprojects the polygon geometry to match the raster's CRS,
-    clips the dataset, and returns spatial mean statistics and seasonal sum.
+    box for the given period (via wapordl, always the current/corrected
+    dataset), clips each one to the EXACT polygon shape, and returns:
+        df            — DataFrame with columns [date, npp_mean]
+        last_raster   — (masked_array, transform) for the most recent date
+        last_date_val — date/label string for that most recent raster
+        tif_paths     — list of downloaded filenames, for diagnostics
     """
     bbox = polygon_bbox(geometry)
 
@@ -269,6 +268,7 @@ def fetch_npp_series(geometry, start_date, end_date, work_dir):
     rows = []
     last_raster = None
     last_date_val = None
+    diag_info = []  # per-file diagnostics: CRS + whether masking succeeded
 
     for path in tif_paths:
         with rasterio.open(path) as src:
@@ -276,26 +276,31 @@ def fetch_npp_series(geometry, start_date, end_date, work_dir):
             offset = src.offsets[0] if src.offsets and src.offsets[0] else 0.0
             nodata = src.nodata if src.nodata is not None else -9999
 
+            # Reproject the (lon/lat) polygon into this raster's actual CRS
+            # before clipping — WaPOR L3 rasters are typically in a UTM zone,
+            # not EPSG:4326, and rasterio.mask requires matching CRS.
+            geom_for_mask = reproject_geometry(geometry, src.crs)
+
             try:
-                # Dynamically reproject input geometry (EPSG:4326) to match raster CRS (e.g., EPSG:32636)
-                target_geom = reproject_geometry(geometry, src.crs)
-                clipped, transform_mat = rio_mask(src, [target_geom], crop=True, nodata=nodata)
-            except ValueError:
-                # Skips only if polygon is truly outside the raster spatial extent
-                continue
+                clipped, transform = rio_mask(src, [geom_for_mask], crop=True, nodata=nodata)
+                diag_info.append({"file": os.path.basename(path), "crs": str(src.crs), "status": "clipped OK"})
+            except ValueError as e:
+                diag_info.append({"file": os.path.basename(path), "crs": str(src.crs), "status": f"NO OVERLAP: {e}"})
+                continue  # polygon does not overlap this raster at all
 
             band = clipped[0].astype("float64")
             band[band == nodata] = np.nan
-            band = band * scale + offset  # Apply WaPOR scale factor explicitly
+            band = band * scale + offset  # apply WaPOR's scale factor explicitly
 
             valid = band[~np.isnan(band)]
             if valid.size == 0:
+                diag_info[-1]["status"] += " (but 0 valid pixels after masking)"
                 continue
 
             date_str = _date_from_filename(path)
             rows.append({"date": date_str or path, "npp_mean": float(np.mean(valid))})
 
-            last_raster = (band, transform_mat)
+            last_raster = (band, transform)
             last_date_val = date_str or os.path.basename(path)
 
     df = pd.DataFrame(rows)
@@ -303,7 +308,7 @@ def fetch_npp_series(geometry, start_date, end_date, work_dir):
         df = df.sort_values("date").reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"])
 
-    return df, last_raster, last_date_val, tif_paths
+    return df, last_raster, last_date_val, tif_paths, diag_info
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,10 +326,12 @@ st.write(
 with st.expander("ℹ️ About this data"):
     st.markdown("""
 - **Source:** WaPOR v3, Level 3, Monthly NPP (`L3-NPP-M`) — 20 m resolution, Northern Egypt coverage.
-- **Access:** Official FAO `wapordl` package — no API key or login required.
+- **Access:** the official FAO `wapordl` package, which always resolves to the current,
+  corrected dataset via FAO's catalog — no API key or login required, and no risk of
+  accidentally pulling a stale pre-correction copy from a hand-picked storage path.
 - **Units:** gC/m²/month.
 - **Total seasonal NPP** = sum of the monthly spatial-mean values across your chosen date range.
-- Scale factor (0.001) and spatial coordinate reprojecting are handled automatically.
+- Scale factor (0.001) and no-data value (-9999) are applied automatically by this app.
 """)
 
 uploaded_file = st.file_uploader("Upload field boundary (zipped Shapefile, .kml, or .kmz)", type=["zip", "kml", "kmz"])
@@ -356,7 +363,7 @@ if st.button("Run Analysis", type="primary"):
 
         with st.spinner(f"Downloading WaPOR NPP data for {poly['name']}..."):
             try:
-                df, last_raster, last_date_val, tif_paths = fetch_npp_series(
+                df, last_raster, last_date_val, tif_paths, diag_info = fetch_npp_series(
                     poly["geometry"],
                     start_date.strftime("%Y-%m-%d"),
                     end_date.strftime("%Y-%m-%d"),
@@ -368,6 +375,15 @@ if st.button("Run Analysis", type="primary"):
 
         if df.empty:
             st.warning("No NPP data found for this polygon/date range.")
+            with st.expander(f"🔧 Diagnostics — why no data was found ({poly['name']})"):
+                if not tif_paths:
+                    st.write("No files were even downloaded — check the date range and that "
+                             "the boundary falls within WaPOR's Northern Egypt (ENO) coverage.")
+                else:
+                    st.write(f"{len(tif_paths)} file(s) were downloaded, but none could be "
+                              "clipped to your polygon. Details per file:")
+                    for d in diag_info:
+                        st.text(f"{d['file']}  |  raster CRS: {d['crs']}  |  {d['status']}")
             continue
 
         fig, ax = plt.subplots(figsize=(10, 3.5))
@@ -399,7 +415,7 @@ if st.button("Run Analysis", type="primary"):
                             key=f"dl_{poly['name']}")
 
         if last_raster is not None:
-            band, transform_mat = last_raster
+            band, transform = last_raster
             st.markdown(f"**🗺️ NPP map — most recent date ({last_date_val})**")
             fig2, ax2 = plt.subplots(figsize=(5, 5))
             im = ax2.imshow(band, cmap="YlGn")
@@ -409,6 +425,6 @@ if st.button("Run Analysis", type="primary"):
             st.pyplot(fig2)
 
         with st.expander(f"🔧 Diagnostics — files downloaded for {poly['name']}"):
-            st.write("If dates in the chart/table look wrong, check these actual filenames:")
-            for p in tif_paths:
-                st.text(os.path.basename(p))
+            st.write("If dates or values in the chart/table look wrong, check these details:")
+            for d in diag_info:
+                st.text(f"{d['file']}  |  raster CRS: {d['crs']}  |  {d['status']}")
