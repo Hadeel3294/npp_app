@@ -1,0 +1,8 @@
+streamlit
+wapordl
+rasterio
+pyshp
+pyproj
+pandas
+matplotlib
+numpy
