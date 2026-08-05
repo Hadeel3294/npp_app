@@ -1,4 +1,5 @@
 streamlit
+gdal==3.10.3
 wapordl
 rasterio
 pyshp
